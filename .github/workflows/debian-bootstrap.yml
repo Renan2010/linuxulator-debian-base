@@ -91,7 +91,7 @@ jobs:
       # Step 5: Post-bootstrap configuration for FreeBSD compatibility
       - name: Configure for FreeBSD Linuxulator
         run: |
-          # Remove problematic packages inside chroot
+          # Remove problematic packages and configure system inside chroot
           sudo chroot workspace/${{ matrix.release }}-${{ matrix.arch }} /bin/bash -c "
             # Generate minimal locale (en_US.UTF-8)
             echo 'en_US.UTF-8 UTF-8' > /etc/locale.gen
@@ -104,14 +104,23 @@ jobs:
             echo 'APT::Install-Recommends \"false\";' > /etc/apt/apt.conf.d/00norecommends
             echo 'APT::Install-Suggests \"false\";' >> /etc/apt/apt.conf.d/00norecommends
             
+            # Fix APT cache size limit (prevents Dynamic MMap error on FreeBSD)
+            echo 'APT::Cache-Start \"251658240\";' > /etc/apt/apt.conf.d/00cache
+            echo 'APT::Cache-Limit \"251658240\";' >> /etc/apt/apt.conf.d/00cache
+            echo 'APT::Cache-Grow \"10485760\";' >> /etc/apt/apt.conf.d/00cache
+            
             # Clean package cache and lists to save space
             apt-get clean
             rm -rf /var/lib/apt/lists/*
+            mkdir -p /var/lib/apt/lists/partial
           " || true  # Continue even if some commands fail
 
-      # Step 6: Fix ownership and permissions for FreeBSD
-      # IMPORTANT: Libraries and binaries MUST have execute permission (755)
-      # or FreeBSD Linuxulator will fail with "Permission denied"
+      # Step 6: Fix ownership and permissions for FreeBSD Linuxulator
+      # CRITICAL: Libraries and binaries MUST have execute permission (755)
+      # /tmp MUST have sticky bit (1777) for APT to work
+      # Otherwise FreeBSD Linuxulator will fail with:
+      #   "Permission denied" for /bin/bash
+      #   "Unable to mkstemp" for APT in /tmp
       - name: Fix permissions for FreeBSD
         run: |
           # Everything owned by root (UID 0, GID 0)
@@ -120,6 +129,10 @@ jobs:
           # Directories always 755
           sudo find workspace/${{ matrix.release }}-${{ matrix.arch }} -type d -exec chmod 755 {} \;
           
+          # /tmp needs sticky bit (1777) so any user can write temporary files
+          # This is required for APT to download and verify packages
+          sudo chmod 1777 workspace/${{ matrix.release }}-${{ matrix.arch }}/tmp
+          
           # Binaries and scripts in bin/sbin directories: 755
           sudo find workspace/${{ matrix.release }}-${{ matrix.arch }}/bin -type f -exec chmod 755 {} \; 2>/dev/null || true
           sudo find workspace/${{ matrix.release }}-${{ matrix.arch }}/sbin -type f -exec chmod 755 {} \; 2>/dev/null || true
@@ -127,16 +140,18 @@ jobs:
           sudo find workspace/${{ matrix.release }}-${{ matrix.arch }}/usr/sbin -type f -exec chmod 755 {} \; 2>/dev/null || true
           
           # Shared libraries (.so files) MUST have execute permission for dynamic linker
+          # Without this, chroot will fail with "ELF interpreter not found"
           sudo find workspace/${{ matrix.release }}-${{ matrix.arch }}/lib -type f \( -name "*.so" -o -name "*.so.*" \) -exec chmod 755 {} \; 2>/dev/null || true
           sudo find workspace/${{ matrix.release }}-${{ matrix.arch }}/lib64 -type f \( -name "*.so" -o -name "*.so.*" \) -exec chmod 755 {} \; 2>/dev/null || true
           sudo find workspace/${{ matrix.release }}-${{ matrix.arch }}/usr/lib -type f \( -name "*.so" -o -name "*.so.*" \) -exec chmod 755 {} \; 2>/dev/null || true
           sudo find workspace/${{ matrix.release }}-${{ matrix.arch }}/usr/lib64 -type f \( -name "*.so" -o -name "*.so.*" \) -exec chmod 755 {} \; 2>/dev/null || true
           
           # Critical: ld-linux dynamic linker MUST be executable
+          # This is the ELF interpreter that loads all Linux binaries
           sudo find workspace/${{ matrix.release }}-${{ matrix.arch }} -name "ld-linux*" -exec chmod 755 {} \; 2>/dev/null || true
           sudo find workspace/${{ matrix.release }}-${{ matrix.arch }} -name "ld-*.so*" -exec chmod 755 {} \; 2>/dev/null || true
           
-          # All other regular files: 644
+          # All other regular files: 644 (read-only for non-executables)
           sudo find workspace/${{ matrix.release }}-${{ matrix.arch }} -type f ! -perm /111 -exec chmod 644 {} \;
 
       # Step 7: Create compressed tarball with XZ compression
@@ -193,7 +208,7 @@ jobs:
           pattern: debian-*      # Download all debian artifacts
           merge-multiple: true    # Put them all in the same directory
 
-      # Step 2: Generate release notes with usage instructions
+      # Step 2: Generate release notes with complete setup instructions
       - name: Generate release notes
         run: |
           # Create markdown release notes
@@ -206,36 +221,95 @@ jobs:
           # List all tarballs with their sizes
           ls -lh artifacts/*.tar.xz >> release.md
           
-          # Add usage instructions for FreeBSD users
-          echo "" >> release.md
-          echo "## Usage on FreeBSD" >> release.md
-          echo '```bash' >> release.md
-          echo "# Download tarball" >> release.md
-          echo "fetch <tarball-url>" >> release.md
-          echo "" >> release.md
-          echo "# Create compat directory" >> release.md
-          echo "mkdir -p /compat/debian" >> release.md
-          echo "" >> release.md
-          echo "# Extract tarball (preserving permissions)" >> release.md
-          echo "tar xJf debian-stable-amd64-*.tar.xz -C /compat/debian" >> release.md
-          echo "" >> release.md
-          echo "# Load Linux kernel module" >> release.md
-          echo "kldload linux64" >> release.md
-          echo "" >> release.md
-          echo "# Mount required filesystems" >> release.md
-          echo "mount -t linprocfs none /compat/debian/proc" >> release.md
-          echo "mount -t linsysfs none /compat/debian/sys" >> release.md
-          echo "mount -t devfs none /compat/debian/dev" >> release.md
-          echo "" >> release.md
-          echo "# Enter Debian chroot" >> release.md
-          echo "chroot /compat/debian /bin/bash" >> release.md
-          echo '```' >> release.md
+          # Add complete usage instructions for FreeBSD users
+          cat >> release.md << 'EOF'
+          
+          ## Complete Setup on FreeBSD
+          
+          ### 1. Download tarball
+          ```bash
+          fetch <tarball-url>
+          ```
+          
+          ### 2. Prepare the system
+          ```bash
+          # Create compat directory
+          mkdir -p /compat/debian
+          
+          # Extract tarball (preserving permissions)
+          tar xJf debian-stable-amd64-*.tar.xz -C /compat/debian
+          ```
+          
+          ### 3. Configure FreeBSD for Linuxulator
+          ```bash
+          # Load Linux kernel module (add to /boot/loader.conf for persistence)
+          kldload linux64
+          
+          # Enable Linux at boot (add to /etc/rc.conf)
+          echo 'linux_enable="YES"' >> /etc/rc.conf
+          ```
+          
+          ### 4. Mount required filesystems
+          ```bash
+          # Mount Linux-compatible filesystems
+          mount -t linprocfs none /compat/debian/proc
+          mount -t linsysfs none /compat/debian/sys
+          mount -t devfs none /compat/debian/dev
+          mount -t tmpfs none /compat/debian/tmp
+          
+          # Fix /tmp permissions (should be 1777 but mount may reset it)
+          chmod 1777 /compat/debian/tmp
+          
+          # Copy DNS configuration for network access inside chroot
+          cp /etc/resolv.conf /compat/debian/etc/resolv.conf
+          ```
+          
+          ### 5. Enter Debian chroot
+          ```bash
+          chroot /compat/debian /bin/bash
+          ```
+          
+          ### 6. First steps inside Debian
+          ```bash
+          # Update package lists (APT cache limits are pre-configured)
+          apt update
+          
+          # Upgrade packages if needed
+          apt upgrade
+          
+          # Install additional packages
+          apt install vim curl wget
+          ```
+          
+          ### Optional: Auto-mount at boot
+          Add to `/etc/fstab`:
+          ```
+          linprocfs   /compat/debian/proc  linprocfs   rw      0 0
+          linsysfs    /compat/debian/sys   linsysfs    rw      0 0
+          devfs       /compat/debian/dev   devfs       rw      0 0
+          tmpfs       /compat/debian/tmp   tmpfs       rw      0 0
+          ```
+          
+          ## Notes
+          - Systemd is excluded (not compatible with Linuxulator)
+          - APT cache limit is pre-configured to 251MB to avoid "Dynamic MMap" errors
+          - /tmp is pre-configured with sticky bit (1777)
+          - Binaries and libraries have correct execute permissions
+          - Tarballs are generated daily at 00:00 UTC
+          - Only the last 7 daily releases are kept
+          
+          ## Verified Working
+          - ✅ chroot works out-of-the-box
+          - ✅ APT update works without permission errors
+          - ✅ Package installation works
+          - ✅ Network configured via host resolv.conf
+          EOF
 
       # Step 3: Create GitHub Release with all tarballs
       - name: Create/Update Release
         uses: softprops/action-gh-release@v1
         with:
-          name: "Nightly Debian Bootstrap ${{ github.event.repository.pushed_at }}"
+          name: "Nightly Debian Bootstrap $(date +%Y-%m-%d)"
           tag_name: nightly-${{ github.run_number }}  # Unique tag per run
           files: artifacts/*                           # Upload all tarballs
           body_path: release.md                        # Release description

@@ -4,7 +4,7 @@ name: Daily Debian Bootstrap Tarballs
 # Triggers for the workflow
 on:
   schedule:
-    # Runs daily at 00:00 UTC (21:00 Brasília time)
+    # Runs daily at 00:00 UTC
     - cron: '0 0 * * *'
   workflow_dispatch:
     # Allows manual trigger from GitHub UI
@@ -110,15 +110,34 @@ jobs:
           " || true  # Continue even if some commands fail
 
       # Step 6: Fix ownership and permissions for FreeBSD
+      # IMPORTANT: Libraries and binaries MUST have execute permission (755)
+      # or FreeBSD Linuxulator will fail with "Permission denied"
       - name: Fix permissions for FreeBSD
         run: |
           # Everything owned by root (UID 0, GID 0)
           sudo chown -R 0:0 workspace/${{ matrix.release }}-${{ matrix.arch }}
-          # Standard Unix permissions: 755 for directories, 644 for files
+          
+          # Directories always 755
           sudo find workspace/${{ matrix.release }}-${{ matrix.arch }} -type d -exec chmod 755 {} \;
-          sudo find workspace/${{ matrix.release }}-${{ matrix.arch }} -type f -exec chmod 644 {} \;
-          # Executables get 755
-          sudo find workspace/${{ matrix.release }}-${{ matrix.arch }} -type f -executable -exec chmod 755 {} \;
+          
+          # Binaries and scripts in bin/sbin directories: 755
+          sudo find workspace/${{ matrix.release }}-${{ matrix.arch }}/bin -type f -exec chmod 755 {} \; 2>/dev/null || true
+          sudo find workspace/${{ matrix.release }}-${{ matrix.arch }}/sbin -type f -exec chmod 755 {} \; 2>/dev/null || true
+          sudo find workspace/${{ matrix.release }}-${{ matrix.arch }}/usr/bin -type f -exec chmod 755 {} \; 2>/dev/null || true
+          sudo find workspace/${{ matrix.release }}-${{ matrix.arch }}/usr/sbin -type f -exec chmod 755 {} \; 2>/dev/null || true
+          
+          # Shared libraries (.so files) MUST have execute permission for dynamic linker
+          sudo find workspace/${{ matrix.release }}-${{ matrix.arch }}/lib -type f \( -name "*.so" -o -name "*.so.*" \) -exec chmod 755 {} \; 2>/dev/null || true
+          sudo find workspace/${{ matrix.release }}-${{ matrix.arch }}/lib64 -type f \( -name "*.so" -o -name "*.so.*" \) -exec chmod 755 {} \; 2>/dev/null || true
+          sudo find workspace/${{ matrix.release }}-${{ matrix.arch }}/usr/lib -type f \( -name "*.so" -o -name "*.so.*" \) -exec chmod 755 {} \; 2>/dev/null || true
+          sudo find workspace/${{ matrix.release }}-${{ matrix.arch }}/usr/lib64 -type f \( -name "*.so" -o -name "*.so.*" \) -exec chmod 755 {} \; 2>/dev/null || true
+          
+          # Critical: ld-linux dynamic linker MUST be executable
+          sudo find workspace/${{ matrix.release }}-${{ matrix.arch }} -name "ld-linux*" -exec chmod 755 {} \; 2>/dev/null || true
+          sudo find workspace/${{ matrix.release }}-${{ matrix.arch }} -name "ld-*.so*" -exec chmod 755 {} \; 2>/dev/null || true
+          
+          # All other regular files: 644
+          sudo find workspace/${{ matrix.release }}-${{ matrix.arch }} -type f ! -perm /111 -exec chmod 644 {} \;
 
       # Step 7: Create compressed tarball with XZ compression
       - name: Create tarball
@@ -126,7 +145,9 @@ jobs:
           cd workspace/${{ matrix.release }}-${{ matrix.arch }}
           # Create tarball excluding virtual filesystems
           # tar cJf = create + XZ compress + file output
+          # --numeric-owner preserves UID/GID 0:0 for FreeBSD compatibility
           sudo tar cJf ../../debian-${{ matrix.release }}-${{ matrix.arch }}-$(date +%Y%m%d).tar.xz \
+            --numeric-owner \
             --exclude=./dev/* \
             --exclude=./proc/* \
             --exclude=./sys/* \
@@ -189,9 +210,25 @@ jobs:
           echo "" >> release.md
           echo "## Usage on FreeBSD" >> release.md
           echo '```bash' >> release.md
+          echo "# Download tarball" >> release.md
           echo "fetch <tarball-url>" >> release.md
+          echo "" >> release.md
+          echo "# Create compat directory" >> release.md
           echo "mkdir -p /compat/debian" >> release.md
+          echo "" >> release.md
+          echo "# Extract tarball (preserving permissions)" >> release.md
           echo "tar xJf debian-stable-amd64-*.tar.xz -C /compat/debian" >> release.md
+          echo "" >> release.md
+          echo "# Load Linux kernel module" >> release.md
+          echo "kldload linux64" >> release.md
+          echo "" >> release.md
+          echo "# Mount required filesystems" >> release.md
+          echo "mount -t linprocfs none /compat/debian/proc" >> release.md
+          echo "mount -t linsysfs none /compat/debian/sys" >> release.md
+          echo "mount -t devfs none /compat/debian/dev" >> release.md
+          echo "" >> release.md
+          echo "# Enter Debian chroot" >> release.md
+          echo "chroot /compat/debian /bin/bash" >> release.md
           echo '```' >> release.md
 
       # Step 3: Create GitHub Release with all tarballs

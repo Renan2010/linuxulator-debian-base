@@ -1,0 +1,184 @@
+name: Daily Debian Bootstrap Tarballs
+
+on:
+  schedule:
+    # Roda diariamente às 00:00 UTC
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+    # Permite execução manual
+    inputs:
+      releases:
+        description: 'Debian releases (comma-separated)'
+        required: false
+        default: 'stable,testing,unstable'
+        type: string
+      arch:
+        description: 'Architecture'
+        required: false
+        default: 'amd64'
+        type: string
+
+env:
+  ARTIFACT_NAME: debian-bootstrap-${{ github.run_id }}
+  RELEASES: ${{ github.event.inputs.releases || 'stable,testing,unstable' }}
+  ARCH: ${{ github.event.inputs.arch || 'amd64' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        release: 
+          - stable
+          - testing
+          - unstable
+        arch:
+          - amd64
+          - i386
+          - arm64
+          - armhf
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y debootstrap qemu-user-static
+
+      - name: Create workspace
+        run: |
+          mkdir -p workspace/${{ matrix.release }}-${{ matrix.arch }}
+          chmod 755 workspace/${{ matrix.release }}-${{ matrix.arch }}
+
+      - name: Run debootstrap
+        run: |
+          # Para arquiteturas não-nativas, usa qemu
+          EXTRA_ARGS=""
+          HOST_ARCH=$(dpkg --print-architecture)
+          
+          if [ "${{ matrix.arch }}" != "$HOST_ARCH" ]; then
+            EXTRA_ARGS="--foreign"
+          fi
+          
+          sudo debootstrap \
+            --arch=${{ matrix.arch }} \
+            --variant=minbase \
+            --include=apt,ca-certificates,locales,whiptail \
+            --exclude=systemd,systemd-sysv,init \
+            $EXTRA_ARGS \
+            ${{ matrix.release }} \
+            workspace/${{ matrix.release }}-${{ matrix.arch }} \
+            http://deb.debian.org/debian
+
+      - name: Configure for FreeBSD Linuxulator
+        run: |
+          # Remove pacotes problemáticos no Linuxulator
+          sudo chroot workspace/${{ matrix.release }}-${{ matrix.arch }} /bin/bash -c "
+            # Configura locale mínimo
+            echo 'en_US.UTF-8 UTF-8' > /etc/locale.gen
+            locale-gen en_US.UTF-8 2>/dev/null || true
+            
+            # Remove systemd residual
+            apt-get remove --purge -y systemd systemd-sysv 2>/dev/null || true
+            
+            # Configura apt sem systemd
+            echo 'APT::Install-Recommends "false";' > /etc/apt/apt.conf.d/00norecommends
+            echo 'APT::Install-Suggests "false";' >> /etc/apt/apt.conf.d/00norecommends
+            
+            # Limpa cache
+            apt-get clean
+            rm -rf /var/lib/apt/lists/*
+          " || true
+
+      - name: Fix permissions for FreeBSD
+        run: |
+          # Garante permissões corretas
+          sudo chown -R 0:0 workspace/${{ matrix.release }}-${{ matrix.arch }}
+          sudo find workspace/${{ matrix.release }}-${{ matrix.arch }} -type d -exec chmod 755 {} \;
+          sudo find workspace/${{ matrix.release }}-${{ matrix.arch }} -type f -exec chmod 644 {} \;
+          sudo find workspace/${{ matrix.release }}-${{ matrix.arch }} -type f -executable -exec chmod 755 {} \;
+
+      - name: Create tarball
+        run: |
+          cd workspace/${{ matrix.release }}-${{ matrix.arch }}
+          sudo tar cJf ../../debian-${{ matrix.release }}-${{ matrix.arch }}-$(date +%Y%m%d).tar.xz \
+            --exclude=./dev/* \
+            --exclude=./proc/* \
+            --exclude=./sys/* \
+            --exclude=./run/* \
+            --exclude=./tmp/* \
+            .
+          sudo chown $(id -u):$(id -g) ../../debian-${{ matrix.release }}-${{ matrix.arch }}-*.tar.xz
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: debian-${{ matrix.release }}-${{ matrix.arch }}
+          path: debian-${{ matrix.release }}-${{ matrix.arch }}-*.tar.xz
+          compression-level: 0
+          retention-days: 30
+
+      - name: Create checksum
+        run: |
+          cd workspace
+          sha256sum ../debian-${{ matrix.release }}-${{ matrix.arch }}-*.tar.xz > \
+            ../debian-${{ matrix.release }}-${{ matrix.arch }}-$(date +%Y%m%d).sha256
+        continue-on-error: true
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: debian-*
+          merge-multiple: true
+
+      - name: Generate release notes
+        run: |
+          cat > release.md << 'EOF'
+          # Debian Bootstrap Tarballs for FreeBSD Linuxulator
+          
+          Generated on: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          
+          ## Available Tarballs
+          EOF
+          
+          ls -lh artifacts/*.tar.xz >> release.md
+          
+          echo "" >> release.md
+          echo "## Usage on FreeBSD" >> release.md
+          echo '```bash' >> release.md
+          echo "fetch <tarball-url>" >> release.md
+          echo "mkdir -p /compat/debian" >> release.md
+          echo "tar xJf debian-stable-amd64-*.tar.xz -C /compat/debian" >> release.md
+          echo '```' >> release.md
+
+      - name: Create/Update Release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: "Nightly Debian Bootstrap $(date +%Y-%m-%d)"
+          tag_name: nightly-$(date +%Y%m%d)
+          files: artifacts/*
+          body_path: release.md
+          prerelease: false
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cleanup old releases
+        uses: dev-drprasad/delete-older-releases@v0.2.1
+        with:
+          keep_latest: 7
+          delete_tag_pattern: nightly-
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,11 +1,13 @@
+# Workflow name displayed in GitHub Actions tab
 name: Daily Debian Bootstrap Tarballs
 
+# Triggers for the workflow
 on:
   schedule:
-    # Roda diariamente às 00:00 UTC
+    # Runs daily at 00:00 UTC (21:00 Brasília time)
     - cron: '0 0 * * *'
   workflow_dispatch:
-    # Permite execução manual
+    # Allows manual trigger from GitHub UI
     inputs:
       releases:
         description: 'Debian releases (comma-separated)'
@@ -18,51 +20,64 @@ on:
         default: 'amd64'
         type: string
 
+# Global environment variables
 env:
+  # Unique name for artifact grouping per workflow run
   ARTIFACT_NAME: debian-bootstrap-${{ github.run_id }}
+  # Fallback to defaults if not triggered manually
   RELEASES: ${{ github.event.inputs.releases || 'stable,testing,unstable' }}
   ARCH: ${{ github.event.inputs.arch || 'amd64' }}
 
 jobs:
+  # Build job - runs debootstrap for each release/arch combination
   build:
     runs-on: ubuntu-latest
     strategy:
-      fail-fast: false
+      fail-fast: false  # Don't cancel other builds if one fails
       matrix:
         release: 
-          - stable
-          - testing
-          - unstable
+          - stable    # Currently Bookworm
+          - testing   # Currently Trixie
+          - unstable  # Sid - rolling release
         arch:
-          - amd64
-          - i386
-          - arm64
-          - armhf
+          - amd64     # 64-bit x86
+          - i386      # 32-bit x86
+          - arm64     # 64-bit ARM (Raspberry Pi 4/5, etc)
+          - armhf     # 32-bit ARM hard float (Raspberry Pi 2/3, etc)
     
     steps:
+      # Step 1: Clone the repository
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Step 2: Install native debootstrap and QEMU for cross-architecture support
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y debootstrap qemu-user-static
 
+      # Step 3: Create working directory for this release/arch combination
       - name: Create workspace
         run: |
           mkdir -p workspace/${{ matrix.release }}-${{ matrix.arch }}
           chmod 755 workspace/${{ matrix.release }}-${{ matrix.arch }}
 
+      # Step 4: Bootstrap Debian base system
       - name: Run debootstrap
         run: |
-          # Para arquiteturas não-nativas, usa qemu
+          # For non-native architectures, use QEMU user mode emulation
           EXTRA_ARGS=""
           HOST_ARCH=$(dpkg --print-architecture)
           
+          # If target architecture differs from host, first stage only
           if [ "${{ matrix.arch }}" != "$HOST_ARCH" ]; then
             EXTRA_ARGS="--foreign"
           fi
           
+          # debootstrap options:
+          # --variant=minbase: Minimal base system (smaller tarball)
+          # --include: Essential packages for Linuxulator
+          # --exclude: Remove systemd (incompatible with FreeBSD Linuxulator)
           sudo debootstrap \
             --arch=${{ matrix.arch }} \
             --variant=minbase \
@@ -73,37 +88,44 @@ jobs:
             workspace/${{ matrix.release }}-${{ matrix.arch }} \
             http://deb.debian.org/debian
 
+      # Step 5: Post-bootstrap configuration for FreeBSD compatibility
       - name: Configure for FreeBSD Linuxulator
         run: |
-          # Remove pacotes problemáticos no Linuxulator
+          # Remove problematic packages inside chroot
           sudo chroot workspace/${{ matrix.release }}-${{ matrix.arch }} /bin/bash -c "
-            # Configura locale mínimo
+            # Generate minimal locale (en_US.UTF-8)
             echo 'en_US.UTF-8 UTF-8' > /etc/locale.gen
             locale-gen en_US.UTF-8 2>/dev/null || true
             
-            # Remove systemd residual
+            # Purge any remaining systemd traces
             apt-get remove --purge -y systemd systemd-sysv 2>/dev/null || true
             
-            # Configura apt sem systemd
-            echo 'APT::Install-Recommends "false";' > /etc/apt/apt.conf.d/00norecommends
-            echo 'APT::Install-Suggests "false";' >> /etc/apt/apt.conf.d/00norecommends
+            # Configure APT to not install recommended/suggested packages
+            echo 'APT::Install-Recommends \"false\";' > /etc/apt/apt.conf.d/00norecommends
+            echo 'APT::Install-Suggests \"false\";' >> /etc/apt/apt.conf.d/00norecommends
             
-            # Limpa cache
+            # Clean package cache and lists to save space
             apt-get clean
             rm -rf /var/lib/apt/lists/*
-          " || true
+          " || true  # Continue even if some commands fail
 
+      # Step 6: Fix ownership and permissions for FreeBSD
       - name: Fix permissions for FreeBSD
         run: |
-          # Garante permissões corretas
+          # Everything owned by root (UID 0, GID 0)
           sudo chown -R 0:0 workspace/${{ matrix.release }}-${{ matrix.arch }}
+          # Standard Unix permissions: 755 for directories, 644 for files
           sudo find workspace/${{ matrix.release }}-${{ matrix.arch }} -type d -exec chmod 755 {} \;
           sudo find workspace/${{ matrix.release }}-${{ matrix.arch }} -type f -exec chmod 644 {} \;
+          # Executables get 755
           sudo find workspace/${{ matrix.release }}-${{ matrix.arch }} -type f -executable -exec chmod 755 {} \;
 
+      # Step 7: Create compressed tarball with XZ compression
       - name: Create tarball
         run: |
           cd workspace/${{ matrix.release }}-${{ matrix.arch }}
+          # Create tarball excluding virtual filesystems
+          # tar cJf = create + XZ compress + file output
           sudo tar cJf ../../debian-${{ matrix.release }}-${{ matrix.arch }}-$(date +%Y%m%d).tar.xz \
             --exclude=./dev/* \
             --exclude=./proc/* \
@@ -111,50 +133,59 @@ jobs:
             --exclude=./run/* \
             --exclude=./tmp/* \
             .
+          # Change ownership to runner user for artifact upload
           sudo chown $(id -u):$(id -g) ../../debian-${{ matrix.release }}-${{ matrix.arch }}-*.tar.xz
 
+      # Step 8: Upload tarball as build artifact
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
+          # Unique name per release/arch combination
           name: debian-${{ matrix.release }}-${{ matrix.arch }}
           path: debian-${{ matrix.release }}-${{ matrix.arch }}-*.tar.xz
-          compression-level: 0
-          retention-days: 30
+          compression-level: 0  # Already compressed, don't re-compress
+          retention-days: 30    # Keep artifacts for 30 days
 
+      # Step 9: Generate SHA256 checksum for integrity verification
       - name: Create checksum
         run: |
           cd workspace
           sha256sum ../debian-${{ matrix.release }}-${{ matrix.arch }}-*.tar.xz > \
             ../debian-${{ matrix.release }}-${{ matrix.arch }}-$(date +%Y%m%d).sha256
-        continue-on-error: true
+        continue-on-error: true  # Don't fail build if checksum generation fails
 
+  # Release job - collects all artifacts and publishes as GitHub Release
   release:
-    needs: build
+    needs: build  # Wait for all build jobs to complete
     runs-on: ubuntu-latest
+    # Only create releases for scheduled or manual runs (not commits)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     permissions:
-      contents: write
+      contents: write  # Required to create releases
     
     steps:
+      # Step 1: Download all artifacts from build jobs
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
-          pattern: debian-*
-          merge-multiple: true
+          pattern: debian-*      # Download all debian artifacts
+          merge-multiple: true    # Put them all in the same directory
 
+      # Step 2: Generate release notes with usage instructions
       - name: Generate release notes
         run: |
+          # Create markdown release notes
           cat > release.md << 'EOF'
           # Debian Bootstrap Tarballs for FreeBSD Linuxulator
-          
-          Generated on: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
           
           ## Available Tarballs
           EOF
           
+          # List all tarballs with their sizes
           ls -lh artifacts/*.tar.xz >> release.md
           
+          # Add usage instructions for FreeBSD users
           echo "" >> release.md
           echo "## Usage on FreeBSD" >> release.md
           echo '```bash' >> release.md
@@ -163,22 +194,24 @@ jobs:
           echo "tar xJf debian-stable-amd64-*.tar.xz -C /compat/debian" >> release.md
           echo '```' >> release.md
 
+      # Step 3: Create GitHub Release with all tarballs
       - name: Create/Update Release
         uses: softprops/action-gh-release@v1
         with:
           name: "Nightly Debian Bootstrap ${{ github.event.repository.pushed_at }}"
-          tag_name: nightly-${{ github.run_number }}
-          files: artifacts/*
-          body_path: release.md
-          prerelease: false
-          make_latest: true
+          tag_name: nightly-${{ github.run_number }}  # Unique tag per run
+          files: artifacts/*                           # Upload all tarballs
+          body_path: release.md                        # Release description
+          prerelease: false                            # Mark as stable release
+          make_latest: true                            # Update "latest" pointer
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}    # Auto-generated token
 
+      # Step 4: Remove old releases to save space (keep only last 7)
       - name: Cleanup old releases
         uses: dev-drprasad/delete-older-releases@v0.2.1
         with:
-          keep_latest: 7
-          delete_tag_pattern: nightly-
+          keep_latest: 7                # Keep last 7 nightly releases
+          delete_tag_pattern: nightly-  # Only delete nightly releases
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
